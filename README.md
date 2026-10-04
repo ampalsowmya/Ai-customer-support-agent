@@ -1,6 +1,6 @@
 Below is the complete final README. Replace your current README.md with this entire content.
 
-# Hiver AI Customer Support Agent
+#  AI Customer Support Agent
 
 An explainable AI-assisted customer support agent built as a take-home SDE Intern assignment.
 

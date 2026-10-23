@@ -1,0 +1,315 @@
+"""Lightweight IT help-desk API added for the Virtusa L1 Support portfolio demo."""
+from datetime import datetime, timezone, timedelta
+import os
+import sqlite3
+from typing import Optional
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
+
+router = APIRouter(prefix="/helpdesk", tags=["IT Help Desk"])
+
+DB_PATH = os.getenv("HELPDESK_DB_PATH", "data/helpdesk.db")
+PRIORITIES = {"low", "medium", "high", "critical"}
+STATUSES = {"open", "in_progress", "resolved", "escalated"}
+# Demo targets, not a claim about any real company's SLA policy.
+SLA_HOURS = {"low": 72, "medium": 24, "high": 8, "critical": 2}
+
+KNOWLEDGE_BASE = [
+    {"id": "KB-001", "title": "Cannot access an account", "category": "account_access", "keywords": ["login", "password", "locked", "account", "credentials"], "steps": ["Confirm the username and sign-in URL.", "Check keyboard layout and Caps Lock.", "Use the approved password-reset process.", "Escalate suspected account compromise or repeated lockouts."]},
+    {"id": "KB-002", "title": "Network connectivity issue", "category": "network", "keywords": ["network", "internet", "wifi", "wi-fi", "connection", "offline"], "steps": ["Check whether other approved services are reachable.", "Verify Wi-Fi or Ethernet connection.", "Restart the network adapter only if permitted by local policy.", "Record any error message and escalate persistent failures."]},
+    {"id": "KB-003", "title": "DNS or website resolution failure", "category": "dns_http", "keywords": ["dns", "website", "domain", "http", "502", "404", "resolve"], "steps": ["Record the exact URL and error code.", "Check whether the issue affects one site or multiple sites.", "Run approved DNS lookup diagnostics.", "Escalate with timestamps and diagnostic output."]},
+    {"id": "KB-004", "title": "Windows or Linux application problem", "category": "system_application", "keywords": ["crash", "application", "app", "linux", "windows", "boot", "slow", "freeze"], "steps": ["Record the operating system and application version.", "Capture the exact error and steps to reproduce.", "Check available disk space and relevant logs.", "Escalate if the issue persists or affects multiple users."]},
+    {"id": "KB-005", "title": "Suspicious activity or possible security incident", "category": "security", "keywords": ["phishing", "hacked", "malware", "suspicious", "breach", "stolen", "unauthorized"], "steps": ["Do not ask the user to share passwords or authentication codes.", "Preserve relevant evidence and timestamps.", "Follow the organization's incident-response policy.", "Escalate immediately to the security team."]},
+]
+
+
+def _now():
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def _connect():
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    con = sqlite3.connect(DB_PATH, timeout=10)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
+    return con
+
+
+def init_db():
+    with _connect() as con:
+        con.execute("""CREATE TABLE IF NOT EXISTS tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            category TEXT NOT NULL,
+            priority TEXT NOT NULL,
+            status TEXT NOT NULL,
+            requester TEXT NOT NULL,
+            assigned_to TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            due_at TEXT NOT NULL,
+            resolved_at TEXT,
+            resolution_notes TEXT
+        )""")
+
+
+class TicketCreate(BaseModel):
+    title: str = Field(min_length=3, max_length=160)
+    description: str = Field(min_length=5, max_length=5000)
+    requester: str = Field(default="demo.user", min_length=1, max_length=120)
+    priority: Optional[str] = None
+    assigned_to: Optional[str] = Field(default=None, max_length=120)
+
+
+class TicketUpdate(BaseModel):
+    status: Optional[str] = None
+    priority: Optional[str] = None
+    assigned_to: Optional[str] = Field(default=None, max_length=120)
+    resolution_notes: Optional[str] = Field(default=None, max_length=3000)
+
+
+def classify_issue(text: str):
+    value = text.lower()
+    rules = [
+        ("security", ["phishing", "hacked", "malware", "suspicious", "breach", "unauthorized", "stolen"]),
+        ("dns_http", ["dns", "http", "404", "502", "website", "domain", "resolve"]),
+        ("network", ["network", "internet", "wifi", "wi-fi", "connection", "offline"]),
+        ("account_access", ["login", "password", "locked", "credentials", "sign in", "sign-in"]),
+        ("system_application", ["crash", "application", "app", "windows", "linux", "boot", "slow", "freeze"]),
+    ]
+    for category, terms in rules:
+        if any(term in value for term in terms):
+            return category
+    return "general_it"
+
+
+def recommend_priority(text: str, requested: Optional[str] = None):
+    if requested:
+        normalized = requested.lower()
+        if normalized not in PRIORITIES:
+            raise HTTPException(status_code=422, detail=f"priority must be one of {sorted(PRIORITIES)}")
+        return normalized
+    value = text.lower()
+    if any(term in value for term in ["security incident", "ransomware", "malware", "breach", "all users down", "production down"]):
+        return "critical"
+    if any(term in value for term in ["cannot work", "can't work", "multiple users", "outage", "urgent"]):
+        return "high"
+    if any(term in value for term in ["intermittent", "slow", "degraded"]):
+        return "medium"
+    return "low"
+
+
+def _serialize(row):
+    item = dict(row)
+    due = datetime.fromisoformat(item["due_at"])
+    item["sla_breached"] = _now() > due and item["status"] != "resolved"
+    item["sla_target_hours"] = SLA_HOURS[item["priority"]]
+    return item
+
+
+@router.on_event("startup")
+def _startup():
+    init_db()
+
+
+@router.get("/health")
+def helpdesk_health():
+    init_db()
+    return {"status": "ok", "service": "it-helpdesk", "database": "sqlite"}
+
+
+@router.get("/knowledge-base")
+def knowledge_base(q: Optional[str] = Query(default=None, max_length=200)):
+    if not q:
+        return KNOWLEDGE_BASE
+    terms = q.lower().split()
+    ranked = []
+    for article in KNOWLEDGE_BASE:
+        haystack = " ".join([article["title"], article["category"], *article["keywords"], *article["steps"]]).lower()
+        score = sum(term in haystack for term in terms)
+        if score:
+            ranked.append((score, article))
+    return [article for _, article in sorted(ranked, key=lambda pair: pair[0], reverse=True)]
+
+
+@router.post("/tickets", status_code=201)
+def create_ticket(payload: TicketCreate):
+    init_db()
+    now = _now()
+    category = classify_issue(payload.title + " " + payload.description)
+    priority = recommend_priority(payload.title + " " + payload.description, payload.priority)
+    due = now + timedelta(hours=SLA_HOURS[priority])
+    with _connect() as con:
+        cur = con.execute("""INSERT INTO tickets
+            (title, description, category, priority, status, requester, assigned_to, created_at, updated_at, due_at)
+            VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)""",
+            (payload.title.strip(), payload.description.strip(), category, priority, payload.requester.strip(), payload.assigned_to, now.isoformat(), now.isoformat(), due.isoformat()))
+        row = con.execute("SELECT * FROM tickets WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return _serialize(row)
+
+
+@router.get("/tickets")
+def list_tickets(status: Optional[str] = None, priority: Optional[str] = None, limit: int = Query(default=100, ge=1, le=500)):
+    init_db()
+    if status and status not in STATUSES:
+        raise HTTPException(status_code=422, detail=f"status must be one of {sorted(STATUSES)}")
+    if priority and priority not in PRIORITIES:
+        raise HTTPException(status_code=422, detail=f"priority must be one of {sorted(PRIORITIES)}")
+    sql, params = "SELECT * FROM tickets", []
+    clauses = []
+    if status:
+        clauses.append("status = ?"); params.append(status)
+    if priority:
+        clauses.append("priority = ?"); params.append(priority)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY created_at DESC LIMIT ?"; params.append(limit)
+    with _connect() as con:
+        rows = con.execute(sql, params).fetchall()
+    return [_serialize(row) for row in rows]
+
+
+@router.get("/tickets/{ticket_id}")
+def get_ticket(ticket_id: int):
+    init_db()
+    with _connect() as con:
+        row = con.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    return _serialize(row)
+
+
+@router.patch("/tickets/{ticket_id}")
+def update_ticket(ticket_id: int, payload: TicketUpdate):
+    init_db()
+    updates = payload.dict(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="Provide at least one field to update")
+    if "status" in updates and updates["status"] not in STATUSES:
+        raise HTTPException(status_code=422, detail=f"status must be one of {sorted(STATUSES)}")
+    if "priority" in updates and updates["priority"] not in PRIORITIES:
+        raise HTTPException(status_code=422, detail=f"priority must be one of {sorted(PRIORITIES)}")
+    with _connect() as con:
+        existing = con.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Ticket not found")
+        now = _now()
+        fields, values = [], []
+        for key, value in updates.items():
+            fields.append(f"{key} = ?"); values.append(value)
+        fields.append("updated_at = ?"); values.append(now.isoformat())
+        if updates.get("status") == "resolved":
+            fields.append("resolved_at = ?"); values.append(now.isoformat())
+        elif updates.get("status") in {"open", "in_progress", "escalated"}:
+            fields.append("resolved_at = NULL")
+        # Recalculate due date when priority changes, using the configured demo SLA.
+        if "priority" in updates:
+            fields.append("due_at = ?")
+            values.append((now + timedelta(hours=SLA_HOURS[updates["priority"]])).isoformat())
+        values.append(ticket_id)
+        con.execute(f"UPDATE tickets SET {', '.join(fields)} WHERE id = ?", values)
+        row = con.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+    return _serialize(row)
+
+
+@router.get("/dashboard")
+def dashboard_summary():
+    init_db()
+    with _connect() as con:
+        rows = con.execute("SELECT * FROM tickets").fetchall()
+    tickets = [_serialize(row) for row in rows]
+    return {
+        "total": len(tickets),
+        "open": sum(t["status"] == "open" for t in tickets),
+        "in_progress": sum(t["status"] == "in_progress" for t in tickets),
+        "resolved": sum(t["status"] == "resolved" for t in tickets),
+        "escalated": sum(t["status"] == "escalated" for t in tickets),
+        "sla_breached": sum(t["sla_breached"] for t in tickets),
+        "by_priority": {p: sum(t["priority"] == p for t in tickets) for p in sorted(PRIORITIES)},
+        "by_category": {c: sum(t["category"] == c for t in tickets) for c in sorted({t["category"] for t in tickets})},
+    }
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from agent.pipeline import run_agent
+from api.helpdesk import router as helpdesk_router
+
+
+app = FastAPI(
+    title="Hiver AI Customer Support Agent",
+    description="AI-powered customer support triage using intent classification and historical case retrieval.",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+app.include_router(helpdesk_router)
+
+
+class TriageRequest(BaseModel):
+    message: str = Field(
+        ...,
+        min_length=1,
+        description="Customer support message",
+    )
+
+    top_k: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Number of historical cases to retrieve",
+    )
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "hiver-ai-support-agent",
+        "endpoints": {
+            "health": "/health",
+            "triage": "/triage",
+        },
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "service": "hiver-ai-support-agent",
+    }
+
+
+@app.post("/triage")
+def triage(request: TriageRequest):
+
+    result = run_agent(
+        request.message,
+        top_k=request.top_k,
+    )
+
+    return {
+        "query": result["query"],
+        "intent": result["intent"],
+        "classifier_confidence": result["classifier_confidence"],
+        "classifier_source": result.get("classifier_source"),
+        "retrieval_similarity": result["retrieval_similarity"],
+        "intent_compatibility": result.get("intent_compatibility"),
+        "combined_score": result.get("combined_score"),
+        "action": result["action"],
+        "decision_reason": result["decision_reason"],
+        "response": result["response"],
+        "grounded": result["grounded"],
+        "needs_escalation": result["needs_escalation"],
+        "historical_cases": result.get("retrieved_cases", []),
+    }

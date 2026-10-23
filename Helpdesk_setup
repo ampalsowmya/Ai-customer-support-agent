@@ -1,0 +1,60 @@
+# Virtusa L1 Support portfolio extension
+
+This extension adds an IT help-desk demonstration to the existing AI Customer Support Agent. It preserves the original `/triage` endpoint and adds a separate `/helpdesk` API.
+
+## Added files
+- `api/helpdesk.py` — SQLite ticket storage, ticket CRUD/list/filter endpoints, category and priority rules, demo SLA calculations, dashboard summary, and troubleshooting knowledge base.
+- `frontend/it-helpdesk.html` — standalone web console for creating and updating tickets, viewing the queue, seeing SLA indicators, and searching knowledge articles.
+- `tests/test_helpdesk.py` — tests for ticket creation, classification, updates, validation, knowledge-base search, and dashboard data.
+- `VIRTUSA_HELPDESK_SETUP.md` — these setup notes.
+
+## Run locally (Windows PowerShell)
+1. Extract the ZIP.
+2. Open PowerShell in the extracted project directory (`Ai-customer-support-agent-main`).
+3. Create and activate a virtual environment:
+   ```powershell
+   py -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   python -m pip install -r requirements.txt
+   ```
+4. Start the API:
+   ```powershell
+   python -m uvicorn api.main:app --reload --host 127.0.0.1 --port 8000
+   ```
+5. Open `http://127.0.0.1:8000/docs` to inspect and try the API.
+6. Open `frontend/it-helpdesk.html` in a browser. If browser file-origin restrictions prevent requests, serve the project folder in another terminal:
+   ```powershell
+   python -m http.server 5500
+   ```
+   Then open `http://127.0.0.1:5500/frontend/it-helpdesk.html`.
+7. Run tests in a separate terminal with the virtual environment active:
+   ```powershell
+   python -m pytest tests/ -q
+   ```
+
+## Endpoints
+- `GET /helpdesk/health`
+- `POST /helpdesk/tickets`
+- `GET /helpdesk/tickets?status=open&priority=high`
+- `GET /helpdesk/tickets/{ticket_id}`
+- `PATCH /helpdesk/tickets/{ticket_id}`
+- `GET /helpdesk/dashboard`
+- `GET /helpdesk/knowledge-base?q=dns`
+- Original AI triage remains at `POST /triage`.
+
+## Example create-ticket request
+```json
+{
+  "title": "Internal website DNS failure",
+  "description": "The internal domain does not resolve for my workstation.",
+  "requester": "demo.user",
+  "priority": "high",
+  "assigned_to": "IT Support"
+}
+```
+
+## Important limitations
+- Category assignment is currently keyword/rule based. It is not a trained IT incident classifier and should be described that way in interviews.
+- SLA targets (Low 72h, Medium 24h, High 8h, Critical 2h) are demo defaults, not Virtusa's actual policy.
+- This is a local portfolio prototype: it has no authentication, role-based access control, email notifications, real ITSM integration, or production hardening. Do not expose it publicly with real customer data.
+- Ticket records are stored in `data/helpdesk.db` by default. Set `HELPDESK_DB_PATH` to change the location.

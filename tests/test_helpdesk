@@ -1,0 +1,59 @@
+import os
+import tempfile
+import pytest
+from fastapi.testclient import TestClient
+
+# Isolate this feature's SQLite database from a developer's real/local demo data.
+_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_db.close()
+os.environ["HELPDESK_DB_PATH"] = _db.name
+
+from api.main import app
+client = TestClient(app)
+
+
+def test_helpdesk_health():
+    response = client.get("/helpdesk/health")
+    assert response.status_code == 200
+    assert response.json()["service"] == "it-helpdesk"
+
+
+def test_create_classify_and_list_ticket():
+    response = client.post("/helpdesk/tickets", json={
+        "title": "Suspicious phishing email received",
+        "description": "I clicked a suspicious link and suspect malware on my laptop.",
+        "requester": "test.user"
+    })
+    assert response.status_code == 201
+    ticket = response.json()
+    assert ticket["category"] == "security"
+    assert ticket["priority"] == "critical"
+    assert ticket["status"] == "open"
+    assert ticket["sla_target_hours"] == 2
+    listed = client.get("/helpdesk/tickets").json()
+    assert any(item["id"] == ticket["id"] for item in listed)
+
+
+def test_update_ticket_to_resolved():
+    created = client.post("/helpdesk/tickets", json={
+        "title": "Website DNS failure", "description": "Internal website domain does not resolve"
+    }).json()
+    response = client.patch(f"/helpdesk/tickets/{created['id']}", json={
+        "status": "resolved", "resolution_notes": "DNS cache checked; service restored."
+    })
+    assert response.status_code == 200
+    assert response.json()["status"] == "resolved"
+    assert response.json()["resolved_at"] is not None
+
+
+def test_reject_invalid_status_and_unknown_ticket():
+    assert client.patch("/helpdesk/tickets/999999", json={"status": "invalid"}).status_code == 422
+    assert client.get("/helpdesk/tickets/999999").status_code == 404
+
+
+def test_knowledge_base_search_and_dashboard():
+    results = client.get("/helpdesk/knowledge-base?q=dns").json()
+    assert results and results[0]["id"] == "KB-003"
+    summary = client.get("/helpdesk/dashboard").json()
+    assert "sla_breached" in summary
+    assert "by_priority" in summary
